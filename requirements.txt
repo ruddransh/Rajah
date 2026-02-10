@@ -1,0 +1,9 @@
+streamlit
+pandas
+requests
+langchain-google-genai
+langchain-core
+pypdf
+python-docx
+python-dotenv
+google-auth-oauthlib
