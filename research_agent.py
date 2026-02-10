@@ -5,6 +5,7 @@ import os
 import datetime
 import time
 import io
+import re
 from dotenv import load_dotenv
 
 # --- AUTH & AI IMPORTS ---
@@ -26,43 +27,32 @@ except ImportError: Document = None
 # ==========================================
 # 🔐 CONFIG & AUTH SETUP
 # ==========================================
-load_dotenv() # Load variables from .env file
+load_dotenv() 
 
 def get_secret(key):
-    # Priority 1: Check Environment Variables (Railway / .env)
-    # This prevents the "SecretNotFoundError" crash on Railway
-    if key in os.environ:
-        return os.environ[key]
-
-    # Priority 2: Check Streamlit Secrets (Local / Streamlit Cloud)
-    # We wrap this in a try/except so it doesn't crash if secrets.toml is missing
+    if key in os.environ: return os.environ[key]
     try:
-        if key in st.secrets:
-            return st.secrets[key]
-    except Exception:
-        pass
-    
+        if key in st.secrets: return st.secrets[key]
+    except: pass
     return None
 
-# Fetch Secrets using the safe function
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 CLIENT_ID = get_secret("GOOGLE_CLIENT_ID")
 CLIENT_SECRET = get_secret("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = get_secret("REDIRECT_URI") 
 
-SCOPES = ['https://www.googleapis.com/auth/drive.file'] 
+# Scope includes reading files and metadata
+SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/drive.file'] 
 CLINICAL_TRIALS_API = "https://clinicaltrials.gov/api/v2/studies"
 
 # ==========================================
 # 🔑 OAUTH 2.0 LOGIN FLOW
 # ==========================================
 def authorize_google():
-    """Handles the 3-legged OAuth flow."""
     if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
-        st.error("⚠️ Missing Google OAuth Secrets in Railway Variables.")
+        st.error("⚠️ Missing Google OAuth Secrets.")
         return None
 
-    # Configuration dictionary for the Flow
     client_config = {
         "web": {
             "client_id": CLIENT_ID,
@@ -71,63 +61,41 @@ def authorize_google():
             "token_uri": "https://oauth2.googleapis.com/token",
         }
     }
+    flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
 
-    # Create the Flow instance
-    flow = Flow.from_client_config(
-        client_config,
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI
-    )
-
-    # 1. Check if we have an Authorization Code from Google (in the URL)
     if "code" in st.query_params:
         code = st.query_params["code"]
         try:
             flow.fetch_token(code=code)
-            credentials = flow.credentials
+            creds = flow.credentials
             st.session_state["google_creds"] = {
-                "token": credentials.token,
-                "refresh_token": credentials.refresh_token,
-                "token_uri": credentials.token_uri,
-                "client_id": credentials.client_id,
-                "client_secret": credentials.client_secret,
-                "scopes": credentials.scopes
+                "token": creds.token, "refresh_token": creds.refresh_token,
+                "token_uri": creds.token_uri, "client_id": creds.client_id,
+                "client_secret": creds.client_secret, "scopes": creds.scopes
             }
-            # Clear the URL code so we don't re-trigger
             st.query_params.clear()
             st.rerun()
-        except Exception as e:
-            st.error(f"Login failed: {e}")
+        except Exception as e: st.error(f"Login failed: {e}")
 
-    # 2. Return Credentials if logged in
     if "google_creds" in st.session_state:
         return Credentials(**st.session_state["google_creds"])
-    
-    # 3. If NOT logged in, show Login Button
     return None
 
 def get_login_url():
-    if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
-        return "#"
-        
+    if not CLIENT_ID: return "#"
     client_config = {
         "web": {
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
+            "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
         }
     }
-    flow = Flow.from_client_config(
-        client_config,
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI
-    )
+    flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
     auth_url, _ = flow.authorization_url(prompt='consent')
     return auth_url
 
 # ==========================================
-# 📂 CORE LOGIC (READERS & AI)
+# 📂 READERS (Local & Drive)
 # ==========================================
 def get_text_from_upload(uploaded_file):
     try:
@@ -143,14 +111,32 @@ def get_text_from_upload(uploaded_file):
             return uploaded_file.read().decode("utf-8")
     except Exception as e: return f"Error: {e}"
 
+def extract_id_from_url(url):
+    # Regex to find the ID between /d/ and /
+    match = re.search(r'/d/([a-zA-Z0-9-_]+)', url)
+    return match.group(1) if match else None
+
+def get_text_from_drive_url(service, url):
+    file_id = extract_id_from_url(url)
+    if not file_id: return "Error: Could not find File ID in URL."
+    
+    try:
+        # Export Google Doc to plain text
+        content = service.files().export_media(fileId=file_id, mimeType='text/plain').execute()
+        return content.decode('utf-8')
+    except Exception as e:
+        return f"Error reading Drive file (Make sure you have access): {e}"
+
+# ==========================================
+# 🩺 SEARCH & ANALYSIS
+# ==========================================
 def fetch_recent_trials(disease_query, months_back=6):
     today = datetime.date.today()
     start_date_threshold = today - datetime.timedelta(days=30*months_back)
     params = {
         "query.term": disease_query,       
         "filter.overallStatus": "RECRUITING,NOT_YET_RECRUITING,ACTIVE_NOT_RECRUITING",
-        "pageSize": 300,                   
-        "sort": "StudyFirstPostDate:desc"  
+        "pageSize": 300, "sort": "StudyFirstPostDate:desc"  
     }
     try:
         headers = {"User-Agent": "ResearchAgent/OAuth"}
@@ -171,10 +157,7 @@ def fetch_recent_trials(disease_query, months_back=6):
             if not start_date_str: continue
 
             try:
-                if len(start_date_str) == 7:
-                    dt = datetime.datetime.strptime(start_date_str, "%Y-%m").date()
-                else:
-                    dt = datetime.datetime.strptime(start_date_str, "%Y-%m-%d").date()
+                dt = datetime.datetime.strptime(start_date_str, "%Y-%m-%d" if len(start_date_str) > 7 else "%Y-%m").date()
                 if dt < start_date_threshold: continue
             except: continue
 
@@ -194,13 +177,11 @@ def fetch_recent_trials(disease_query, months_back=6):
 def analyze_trials(research_text, trials, api_key):
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0.1)
     
-    # 1. Summarize User Paper
     with st.status("Reading your document..."):
         summary_chain = ChatPromptTemplate.from_template("Summarize goals in 3 sentences: {text}") | llm
         research_summary = summary_chain.invoke({"text": research_text[:25000]}).content
         st.write(f"**Context:** {research_summary}")
 
-    # 2. Batch Analysis
     analyzed_data = []
     BATCH_SIZE = 20
     progress = st.progress(0)
@@ -214,7 +195,6 @@ def analyze_trials(research_text, trials, api_key):
     for i in range(0, len(trials), BATCH_SIZE):
         batch = trials[i:i+BATCH_SIZE]
         batch_txt = "\n".join([f"ID: {t['NCT Number']}\nTitle: {t['Study title']}\nSum: {t['BriefSummary'][:500]}\n---" for t in batch])
-        
         try:
             res = (analysis_prompt | llm).invoke({"research_summary": research_summary, "trials_text": batch_txt})
             res_map = {l.split('|')[0].strip(): l.split('|')[1:] for l in res.content.split('\n') if '|' in l}
@@ -223,8 +203,7 @@ def analyze_trials(research_text, trials, api_key):
                 if t['NCT Number'] in res_map and len(res_map[t['NCT Number']]) >= 3:
                     vals = res_map[t['NCT Number']]
                     t['AI Relevance'], t['AI Reason'], t['AI Potential'] = vals[0].strip(), vals[1].strip(), vals[2].strip()
-                else:
-                    t['AI Relevance'] = "No"
+                else: t['AI Relevance'] = "No"
                 if 'BriefSummary' in t: del t['BriefSummary']
                 analyzed_data.append(t)
         except: pass
@@ -232,16 +211,13 @@ def analyze_trials(research_text, trials, api_key):
 
     return pd.DataFrame(analyzed_data)
 
-def upload_to_drive(creds, df, filename):
+def upload_to_drive(service, df, filename):
     try:
-        service = build('drive', 'v3', credentials=creds)
         csv_buffer = io.BytesIO()
         df.to_csv(csv_buffer, index=False)
         csv_buffer.seek(0)
-        
         file_meta = {'name': filename, 'mimeType': 'text/csv'}
         media = MediaIoBaseUpload(csv_buffer, mimetype='text/csv')
-        
         file = service.files().create(body=file_meta, media_body=media, fields='id, webViewLink').execute()
         return file.get('webViewLink')
     except Exception as e:
@@ -249,74 +225,97 @@ def upload_to_drive(creds, df, filename):
         return None
 
 # ==========================================
-# 🚀 MAIN APP
+# 🚀 MAIN APP INTERFACE
 # ==========================================
 def main():
-    st.set_page_config(page_title="Rajah", layout="wide")
+    st.set_page_config(page_title="Rajah - Reseaech AI", layout="wide")
     
-    # --- AUTH SECTION ---
+    # 1. UI: Title in Center (Not Sidebar)
+    st.title("🧬 Rajah - Research AI")
+    
+    # 2. Auth Check
     creds = authorize_google()
-    
+    service = build('drive', 'v3', credentials=creds) if creds else None
+
+    # --- SIDEBAR ---
     with st.sidebar:
-        st.title("🧬 Rajah - Research Agent")
+        st.header("1. Input Method")
+        # Restored Input Options
+        input_method = st.radio("Choose Source:", ["Upload File (PDF/Docx)", "Google Doc URL"])
         
+        research_text = None
+        
+        if input_method == "Upload File (PDF/Docx)":
+            uploaded_file = st.file_uploader("Drop file here", type=['pdf', 'docx', 'txt'])
+            if uploaded_file:
+                research_text = get_text_from_upload(uploaded_file)
+        
+        elif input_method == "Google Doc URL":
+            if not creds:
+                st.warning("⚠️ You must Login to read Docs from Drive.")
+            doc_url = st.text_input("Paste Google Doc Link")
+            if doc_url and creds:
+                with st.spinner("Fetching doc from Drive..."):
+                    research_text = get_text_from_drive_url(service, doc_url)
+
+        st.divider()
+        st.header("2. Settings")
+        disease = st.text_input("Disease", "Rheumatoid Arthritis")
+        months = st.slider("Months Back", 1, 12, 6)
+        
+        # Login/Logout Buttons
+        st.divider()
         if not creds:
-            st.warning("⚠️ Login to enable Auto-Save")
-            login_url = get_login_url()
-            st.link_button("Login with Google", login_url)
+            st.link_button("🔑 Login with Google", get_login_url())
         else:
-            st.success("✅ Logged into Drive")
+            st.success("Logged in as User")
             if st.button("Logout"):
                 del st.session_state["google_creds"]
                 st.rerun()
 
-        st.divider()
-        st.header("1. Upload")
-        uploaded_file = st.file_uploader("Research Paper", type=['pdf', 'docx', 'txt'])
-        
-        st.header("2. Settings")
-        disease = st.text_input("Disease", "Rheumatoid Arthritis")
-        months = st.slider("Months Back", 1, 12, 6)
-        run_btn = st.button("Start Analysis", type="primary")
+    # --- MAIN CONTENT ---
+    if not research_text:
+        st.info("👈 Please upload a file or paste a Google Doc URL to begin.")
+        return
 
-    # --- MAIN EXECUTION ---
-    if run_btn and uploaded_file:
-        if not GEMINI_API_KEY or "PASTE" in GEMINI_API_KEY:
-            st.error("Missing Gemini API Key in Variables/Secrets!")
-            return
+    if "Error" in research_text:
+        st.error(research_text)
+        return
 
-        text = get_text_from_upload(uploaded_file)
-        if "Error" in text:
-            st.error(text)
+    # Run Button in Main Area
+    if st.button("🚀 Start Agent Analysis", type="primary"):
+        if not GEMINI_API_KEY:
+            st.error("Missing Gemini API Key!")
             return
 
         trials = fetch_recent_trials(disease, months)
         
         if trials:
-            st.info(f"Found {len(trials)} trials. Analyzing...")
-            df = analyze_trials(text, trials, GEMINI_API_KEY)
+            st.info(f"Found {len(trials)} trials. Analyzing relevance...")
+            df = analyze_trials(research_text, trials, GEMINI_API_KEY)
             
             if not df.empty:
                 relevant = df[df['AI Relevance'].str.contains("Yes", case=False, na=False)]
-                st.subheader("Results")
+                
+                st.success("Analysis Complete!")
+                st.subheader("High Relevance Updates")
                 st.dataframe(relevant, use_container_width=True)
                 
                 # --- SAVE OPTIONS ---
                 col1, col2 = st.columns(2)
-                
                 with col1:
                     csv = df.to_csv(index=False).encode('utf-8')
                     st.download_button("📥 Download CSV", csv, "updates.csv", "text/csv")
                 
                 with col2:
-                    if creds:
-                        if st.button("☁️ Save to My Google Drive"):
-                            link = upload_to_drive(creds, relevant, f"Updates_{disease}.csv")
+                    if service:
+                        if st.button("☁️ Save to Google Drive"):
+                            link = upload_to_drive(service, relevant, f"Updates_{disease}.csv")
                             if link: st.success(f"Saved! [View File]({link})")
                     else:
-                        st.caption("Login to save directly to Drive.")
+                        st.caption("Login to save to Drive.")
         else:
-            st.warning("No trials found.")
+            st.warning("No recent trials found matching strict criteria.")
 
 if __name__ == "__main__":
     main()
