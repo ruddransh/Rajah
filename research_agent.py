@@ -41,7 +41,6 @@ CLIENT_ID = get_secret("GOOGLE_CLIENT_ID")
 CLIENT_SECRET = get_secret("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = get_secret("REDIRECT_URI") 
 
-# Scope includes reading files and metadata
 SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/drive.file'] 
 CLINICAL_TRIALS_API = "https://clinicaltrials.gov/api/v2/studies"
 
@@ -112,7 +111,6 @@ def get_text_from_upload(uploaded_file):
     except Exception as e: return f"Error: {e}"
 
 def extract_id_from_url(url):
-    # Regex to find the ID between /d/ and /
     match = re.search(r'/d/([a-zA-Z0-9-_]+)', url)
     return match.group(1) if match else None
 
@@ -121,9 +119,31 @@ def get_text_from_drive_url(service, url):
     if not file_id: return "Error: Could not find File ID in URL."
     
     try:
-        # Export Google Doc to plain text
-        content = service.files().export_media(fileId=file_id, mimeType='text/plain').execute()
-        return content.decode('utf-8')
+        # Get Metadata to check file type
+        file_meta = service.files().get(fileId=file_id, fields='mimeType, name').execute()
+        mime_type = file_meta.get('mimeType')
+        
+        # CASE A: Google Doc -> Export
+        if mime_type == 'application/vnd.google-apps.document':
+            content = service.files().export_media(fileId=file_id, mimeType='text/plain').execute()
+            return content.decode('utf-8')
+            
+        # CASE B: PDF/Word -> Download
+        else:
+            request = service.files().get_media(fileId=file_id)
+            file_content = io.BytesIO(request.execute())
+            
+            if 'pdf' in mime_type:
+                if PdfReader is None: return "Error: Install pypdf"
+                reader = PdfReader(file_content)
+                return "\n".join([p.extract_text() for p in reader.pages if p.extract_text()])
+            elif 'wordprocessingml' in mime_type:
+                if Document is None: return "Error: Install python-docx"
+                doc = Document(file_content)
+                return "\n".join([p.text for p in doc.paragraphs])
+            else:
+                return f"Error: Unsupported file type ({mime_type}). Only Google Docs, PDFs, and Word Docs supported."
+
     except Exception as e:
         return f"Error reading Drive file (Make sure you have access): {e}"
 
@@ -228,34 +248,33 @@ def upload_to_drive(service, df, filename):
 # 🚀 MAIN APP INTERFACE
 # ==========================================
 def main():
-    st.set_page_config(page_title="Rajah - Reseaech AI", layout="wide")
-    
-    # 1. UI: Title in Center (Not Sidebar)
+    st.set_page_config(page_title="Rajah", layout="wide")
     st.title("🧬 Rajah - Research AI")
     
-    # 2. Auth Check
+    # 1. Initialize Session State
+    if 'analysis_results' not in st.session_state:
+        st.session_state['analysis_results'] = None
+
     creds = authorize_google()
     service = build('drive', 'v3', credentials=creds) if creds else None
 
     # --- SIDEBAR ---
     with st.sidebar:
         st.header("1. Input Method")
-        # Restored Input Options
-        input_method = st.radio("Choose Source:", ["Upload File (PDF/Docx)", "Google Doc URL"])
+        input_method = st.radio("Choose Source:", ["Upload File", "Google Doc URL"])
         
         research_text = None
         
-        if input_method == "Upload File (PDF/Docx)":
+        if input_method == "Upload File":
             uploaded_file = st.file_uploader("Drop file here", type=['pdf', 'docx', 'txt'])
             if uploaded_file:
                 research_text = get_text_from_upload(uploaded_file)
         
         elif input_method == "Google Doc URL":
-            if not creds:
-                st.warning("⚠️ You must Login to read Docs from Drive.")
+            if not creds: st.warning("⚠️ Login required for Drive files.")
             doc_url = st.text_input("Paste Google Doc Link")
             if doc_url and creds:
-                with st.spinner("Fetching doc from Drive..."):
+                with st.spinner("Fetching from Drive..."):
                     research_text = get_text_from_drive_url(service, doc_url)
 
         st.divider()
@@ -263,59 +282,59 @@ def main():
         disease = st.text_input("Disease", "Rheumatoid Arthritis")
         months = st.slider("Months Back", 1, 12, 6)
         
-        # Login/Logout Buttons
         st.divider()
         if not creds:
             st.link_button("🔑 Login with Google", get_login_url())
         else:
-            st.success("Logged in as User")
+            st.success("Logged in")
             if st.button("Logout"):
                 del st.session_state["google_creds"]
+                st.session_state['analysis_results'] = None # Clear results on logout
                 st.rerun()
 
     # --- MAIN CONTENT ---
-    if not research_text:
-        st.info("👈 Please upload a file or paste a Google Doc URL to begin.")
-        return
-
-    if "Error" in research_text:
-        st.error(research_text)
-        return
-
-    # Run Button in Main Area
     if st.button("🚀 Start Agent Analysis", type="primary"):
-        if not GEMINI_API_KEY:
-            st.error("Missing Gemini API Key!")
-            return
-
-        trials = fetch_recent_trials(disease, months)
+        # Reset previous results
+        st.session_state['analysis_results'] = None
         
-        if trials:
-            st.info(f"Found {len(trials)} trials. Analyzing relevance...")
-            df = analyze_trials(research_text, trials, GEMINI_API_KEY)
-            
-            if not df.empty:
-                relevant = df[df['AI Relevance'].str.contains("Yes", case=False, na=False)]
-                
-                st.success("Analysis Complete!")
-                st.subheader("High Relevance Updates")
-                st.dataframe(relevant, use_container_width=True)
-                
-                # --- SAVE OPTIONS ---
-                col1, col2 = st.columns(2)
-                with col1:
-                    csv = df.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 Download CSV", csv, "updates.csv", "text/csv")
-                
-                with col2:
-                    if service:
-                        if st.button("☁️ Save to Google Drive"):
-                            link = upload_to_drive(service, relevant, f"Updates_{disease}.csv")
-                            if link: st.success(f"Saved! [View File]({link})")
-                    else:
-                        st.caption("Login to save to Drive.")
+        if not research_text or "Error" in research_text:
+            st.error(f"Please provide a valid file. ({research_text if research_text else 'Empty'})")
+        elif not GEMINI_API_KEY:
+            st.error("Missing Gemini API Key!")
         else:
-            st.warning("No recent trials found matching strict criteria.")
+            trials = fetch_recent_trials(disease, months)
+            if trials:
+                st.info(f"Found {len(trials)} trials. Analyzing...")
+                df = analyze_trials(research_text, trials, GEMINI_API_KEY)
+                
+                if not df.empty:
+                    relevant = df[df['AI Relevance'].str.contains("Yes", case=False, na=False)]
+                    st.session_state['analysis_results'] = relevant # SAVE TO SESSION STATE
+                    st.success("Analysis Complete!")
+                else:
+                    st.warning("No relevant trials found.")
+            else:
+                st.warning("No trials found matching strict criteria.")
+
+    # --- PERSISTENT RESULTS DISPLAY ---
+    # This block runs even if you click other buttons, because data is in session_state
+    if st.session_state['analysis_results'] is not None:
+        final_df = st.session_state['analysis_results']
+        st.subheader("High Relevance Updates")
+        st.dataframe(final_df, use_container_width=True)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            csv = final_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download CSV", csv, "updates.csv", "text/csv")
+        
+        with col2:
+            if service:
+                if st.button("☁️ Save to Google Drive"):
+                    link = upload_to_drive(service, final_df, f"Updates_{disease}.csv")
+                    if link: st.success(f"Saved! [View File]({link})")
+            else:
+                st.caption("Login to save to Drive.")
 
 if __name__ == "__main__":
     main()
