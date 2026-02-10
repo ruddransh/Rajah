@@ -6,4 +6,6 @@ langchain-core
 pypdf
 python-docx
 python-dotenv
+
 google-auth-oauthlib
+google-api-python-client
