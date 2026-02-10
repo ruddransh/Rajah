@@ -28,17 +28,29 @@ except ImportError: Document = None
 # ==========================================
 load_dotenv() # Load variables from .env file
 
-# 1. Fetch Secrets (Order: Streamlit Secrets -> Env Vars -> .env)
 def get_secret(key):
-    if key in st.secrets: return st.secrets[key]
-    return os.getenv(key)
+    # Priority 1: Check Environment Variables (Railway / .env)
+    # This prevents the "SecretNotFoundError" crash on Railway
+    if key in os.environ:
+        return os.environ[key]
 
+    # Priority 2: Check Streamlit Secrets (Local / Streamlit Cloud)
+    # We wrap this in a try/except so it doesn't crash if secrets.toml is missing
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    
+    return None
+
+# Fetch Secrets using the safe function
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 CLIENT_ID = get_secret("GOOGLE_CLIENT_ID")
 CLIENT_SECRET = get_secret("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = get_secret("REDIRECT_URI") 
 
-SCOPES = ['https://www.googleapis.com/auth/drive.file'] # Only access files created by this app
+SCOPES = ['https://www.googleapis.com/auth/drive.file'] 
 CLINICAL_TRIALS_API = "https://clinicaltrials.gov/api/v2/studies"
 
 # ==========================================
@@ -46,7 +58,10 @@ CLINICAL_TRIALS_API = "https://clinicaltrials.gov/api/v2/studies"
 # ==========================================
 def authorize_google():
     """Handles the 3-legged OAuth flow."""
-    
+    if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
+        st.error("⚠️ Missing Google OAuth Secrets in Railway Variables.")
+        return None
+
     # Configuration dictionary for the Flow
     client_config = {
         "web": {
@@ -92,6 +107,9 @@ def authorize_google():
     return None
 
 def get_login_url():
+    if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
+        return "#"
+        
     client_config = {
         "web": {
             "client_id": CLIENT_ID,
@@ -153,7 +171,10 @@ def fetch_recent_trials(disease_query, months_back=6):
             if not start_date_str: continue
 
             try:
-                dt = datetime.datetime.strptime(start_date_str, "%Y-%m-%d" if len(start_date_str) > 7 else "%Y-%m").date()
+                if len(start_date_str) == 7:
+                    dt = datetime.datetime.strptime(start_date_str, "%Y-%m").date()
+                else:
+                    dt = datetime.datetime.strptime(start_date_str, "%Y-%m-%d").date()
                 if dt < start_date_threshold: continue
             except: continue
 
@@ -231,13 +252,13 @@ def upload_to_drive(creds, df, filename):
 # 🚀 MAIN APP
 # ==========================================
 def main():
-    st.set_page_config(page_title="Agentic Research Pro", layout="wide")
+    st.set_page_config(page_title="Rajah", layout="wide")
     
     # --- AUTH SECTION ---
     creds = authorize_google()
     
     with st.sidebar:
-        st.title("🧬 Research Agent")
+        st.title("🧬 Rajah - Research Agent")
         
         if not creds:
             st.warning("⚠️ Login to enable Auto-Save")
@@ -261,10 +282,14 @@ def main():
     # --- MAIN EXECUTION ---
     if run_btn and uploaded_file:
         if not GEMINI_API_KEY or "PASTE" in GEMINI_API_KEY:
-            st.error("Missing Gemini API Key in .env or Secrets!")
+            st.error("Missing Gemini API Key in Variables/Secrets!")
             return
 
         text = get_text_from_upload(uploaded_file)
+        if "Error" in text:
+            st.error(text)
+            return
+
         trials = fetch_recent_trials(disease, months)
         
         if trials:
@@ -290,6 +315,8 @@ def main():
                             if link: st.success(f"Saved! [View File]({link})")
                     else:
                         st.caption("Login to save directly to Drive.")
+        else:
+            st.warning("No trials found.")
 
 if __name__ == "__main__":
     main()
